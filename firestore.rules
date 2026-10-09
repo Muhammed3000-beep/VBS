@@ -1,0 +1,190 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+    function profilePath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+    function studentPath(studentId) {
+      return /databases/$(database)/documents/students/$(studentId);
+    }
+    function sessionPath(sessionId) {
+      return /databases/$(database)/documents/attendanceSessions/$(sessionId);
+    }
+    function attendancePath(studentId, sessionId) {
+      return /databases/$(database)/documents/students/$(studentId)/attendance/$(sessionId);
+    }
+    function hasProfile() {
+      return signedIn() && exists(profilePath(request.auth.uid));
+    }
+    function isYbs() {
+      return hasProfile() && get(profilePath(request.auth.uid)).data.role == 'ybs';
+    }
+    function isTeacher() {
+      return hasProfile() && get(profilePath(request.auth.uid)).data.role == 'teacher';
+    }
+    function isVbsUid(uid) {
+      return exists(profilePath(uid)) && get(profilePath(uid)).data.role == 'vbs';
+    }
+    function ownsStudent(studentId) {
+      return signedIn()
+        && exists(studentPath(studentId))
+        && get(studentPath(studentId)).data.parentUid == request.auth.uid;
+    }
+    function validClass(grade, section) {
+      return grade is int && grade in [5, 6, 7, 8]
+        && section in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M'];
+    }
+    function validParentUid(parentUid) {
+      return parentUid == null || (parentUid is string && isVbsUid(parentUid));
+    }
+    function validScore(data) {
+      return data.score is int && data.score >= 0 && data.score <= 100
+        && data.term is int && data.term in [1, 2, 3]
+        && data.assessmentType in ['sinav', 'sozlu']
+        && data.assessmentNo is int && data.assessmentNo in [1, 2, 3, 4, 5];
+    }
+
+    // Rol bilgileri kullanıcı tarafından değiştirilemez. İlk profil Firebase Console'dan eklenir.
+    match /users/{userId} {
+      allow read: if signedIn() && (request.auth.uid == userId || isYbs());
+      allow create, update, delete: if false;
+    }
+
+    match /students/{studentId} {
+      allow read: if isYbs() || isTeacher()
+        || (signedIn() && resource.data.parentUid == request.auth.uid);
+
+      allow create: if isYbs()
+        && request.resource.data.keys().hasOnly(['schoolNumber', 'firstName', 'lastName', 'fullName', 'classGrade', 'section', 'parentUid', 'demo', 'createdAt', 'updatedAt'])
+        && request.resource.data.keys().hasAll(['schoolNumber', 'firstName', 'lastName', 'fullName', 'classGrade', 'section', 'parentUid', 'demo', 'createdAt'])
+        && request.resource.data.schoolNumber is int
+        && request.resource.data.firstName is string
+        && request.resource.data.lastName is string
+        && request.resource.data.fullName is string
+        && validClass(request.resource.data.classGrade, request.resource.data.section)
+        && validParentUid(request.resource.data.parentUid)
+        && request.resource.data.demo == true
+        && request.resource.data.createdAt is timestamp;
+
+      // YBS yalnızca veli bağlantısını değiştirebilir; öğrenci bilgileri ve sınıfı korunur.
+      allow update: if isYbs()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['parentUid', 'updatedAt'])
+        && validParentUid(request.resource.data.parentUid)
+        && (!('updatedAt' in request.resource.data) || request.resource.data.updatedAt is timestamp);
+      allow delete: if false;
+
+      match /attendance/{sessionId} {
+        allow read: if isYbs()
+          || (isTeacher() && resource.data.teacherUid == request.auth.uid)
+          || ownsStudent(studentId);
+
+        // Yoklama, öğretmen tarafından yalnızca ilk oluşturulurken yazılabilir.
+        allow create: if isTeacher()
+          && getAfter(sessionPath(sessionId)).data.teacherUid == request.auth.uid
+          && getAfter(sessionPath(sessionId)).data.date == request.resource.data.date
+          && getAfter(sessionPath(sessionId)).data.classGrade == request.resource.data.classGrade
+          && getAfter(sessionPath(sessionId)).data.section == request.resource.data.section
+          && getAfter(sessionPath(sessionId)).data.lesson == request.resource.data.lesson
+          && request.resource.data.keys().hasOnly(['studentId', 'studentName', 'schoolNumber', 'date', 'sessionId', 'classGrade', 'section', 'lesson', 'teacherUid', 'teacherName', 'subject', 'present', 'recordedAt'])
+          && request.resource.data.keys().hasAll(['studentId', 'studentName', 'schoolNumber', 'date', 'sessionId', 'classGrade', 'section', 'lesson', 'teacherUid', 'teacherName', 'subject', 'present', 'recordedAt'])
+          && request.resource.data.studentId == studentId
+          && request.resource.data.sessionId == sessionId
+          && request.resource.data.teacherUid == request.auth.uid
+          && request.resource.data.teacherName == get(profilePath(request.auth.uid)).data.displayName
+          && request.resource.data.subject == get(profilePath(request.auth.uid)).data.subject
+          && request.resource.data.present is bool
+          && request.resource.data.date.matches('^\\d{4}-\\d{2}-\\d{2}$')
+          && request.resource.data.recordedAt is timestamp
+          && get(studentPath(studentId)).data.fullName == request.resource.data.studentName
+          && get(studentPath(studentId)).data.schoolNumber == request.resource.data.schoolNumber
+          && get(studentPath(studentId)).data.classGrade == request.resource.data.classGrade
+          && get(studentPath(studentId)).data.section == request.resource.data.section
+          && validClass(request.resource.data.classGrade, request.resource.data.section);
+        allow update, delete: if false;
+      }
+
+      match /grades/{gradeId} {
+        allow read: if isYbs()
+          || (isTeacher() && resource.data.teacherUid == request.auth.uid)
+          || ownsStudent(studentId);
+
+        allow create: if isTeacher()
+          && request.resource.data.keys().hasOnly(['studentId', 'studentName', 'schoolNumber', 'classGrade', 'section', 'subject', 'teacherUid', 'teacherName', 'term', 'assessmentType', 'assessmentNo', 'score', 'createdAt', 'updatedAt'])
+          && request.resource.data.keys().hasAll(['studentId', 'studentName', 'schoolNumber', 'classGrade', 'section', 'subject', 'teacherUid', 'teacherName', 'term', 'assessmentType', 'assessmentNo', 'score', 'createdAt', 'updatedAt'])
+          && request.resource.data.studentId == studentId
+          && request.resource.data.teacherUid == request.auth.uid
+          && request.resource.data.teacherName == get(profilePath(request.auth.uid)).data.displayName
+          && request.resource.data.subject == get(profilePath(request.auth.uid)).data.subject
+          && request.resource.data.studentName == get(studentPath(studentId)).data.fullName
+          && request.resource.data.schoolNumber == get(studentPath(studentId)).data.schoolNumber
+          && request.resource.data.classGrade == get(studentPath(studentId)).data.classGrade
+          && request.resource.data.section == get(studentPath(studentId)).data.section
+          && validScore(request.resource.data)
+          && gradeId == request.auth.uid + '_t' + string(request.resource.data.term) + '_' + request.resource.data.assessmentType + '_' + string(request.resource.data.assessmentNo)
+          && request.resource.data.createdAt is timestamp
+          && request.resource.data.updatedAt is timestamp;
+
+        // Öğretmen kendi puanlarını düzenleyebilir; öğrenci/dönem/not kimliği sabit kalır.
+        allow update: if isTeacher()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['score', 'updatedAt'])
+          && resource.data.teacherUid == request.auth.uid
+          && request.resource.data.studentId == resource.data.studentId
+          && request.resource.data.studentName == resource.data.studentName
+          && request.resource.data.schoolNumber == resource.data.schoolNumber
+          && request.resource.data.teacherUid == resource.data.teacherUid
+          && request.resource.data.teacherName == resource.data.teacherName
+          && request.resource.data.subject == resource.data.subject
+          && request.resource.data.classGrade == resource.data.classGrade
+          && request.resource.data.section == resource.data.section
+          && request.resource.data.term == resource.data.term
+          && request.resource.data.assessmentType == resource.data.assessmentType
+          && request.resource.data.assessmentNo == resource.data.assessmentNo
+          && request.resource.data.createdAt == resource.data.createdAt
+          && validScore(request.resource.data)
+          && request.resource.data.updatedAt is timestamp;
+        allow delete: if false;
+      }
+
+      match /attendanceReasons/{sessionId} {
+        allow read: if isYbs() || ownsStudent(studentId);
+        allow create, update: if isYbs()
+          && request.resource.data.keys().hasOnly(['studentId', 'sessionId', 'date', 'classGrade', 'section', 'lesson', 'status', 'reason', 'reviewedBy', 'reviewedAt'])
+          && request.resource.data.keys().hasAll(['studentId', 'sessionId', 'date', 'classGrade', 'section', 'lesson', 'status', 'reason', 'reviewedBy', 'reviewedAt'])
+          && request.resource.data.studentId == studentId
+          && request.resource.data.sessionId == sessionId
+          && request.resource.data.status in ['excused', 'unexcused']
+          && request.resource.data.reason is string
+          && request.resource.data.reason.size() <= 300
+          && request.resource.data.reviewedBy == request.auth.uid
+          && request.resource.data.reviewedAt is timestamp
+          && exists(attendancePath(studentId, sessionId))
+          && get(attendancePath(studentId, sessionId)).data.present == false
+          && get(attendancePath(studentId, sessionId)).data.date == request.resource.data.date
+          && get(attendancePath(studentId, sessionId)).data.classGrade == request.resource.data.classGrade
+          && get(attendancePath(studentId, sessionId)).data.section == request.resource.data.section
+          && get(attendancePath(studentId, sessionId)).data.lesson == request.resource.data.lesson
+          && validClass(request.resource.data.classGrade, request.resource.data.section);
+        allow delete: if false;
+      }
+    }
+
+    match /attendanceSessions/{sessionId} {
+      allow read: if isYbs() || (isTeacher() && resource.data.teacherUid == request.auth.uid);
+      allow create: if isTeacher()
+        && request.resource.data.keys().hasOnly(['date', 'classGrade', 'section', 'lesson', 'teacherUid', 'teacherName', 'subject', 'createdAt'])
+        && request.resource.data.keys().hasAll(['date', 'classGrade', 'section', 'lesson', 'teacherUid', 'teacherName', 'subject', 'createdAt'])
+        && request.resource.data.teacherUid == request.auth.uid
+        && request.resource.data.teacherName == get(profilePath(request.auth.uid)).data.displayName
+        && request.resource.data.subject == get(profilePath(request.auth.uid)).data.subject
+        && validClass(request.resource.data.classGrade, request.resource.data.section)
+        && request.resource.data.lesson is int && request.resource.data.lesson in [1, 2, 3, 4, 5, 6, 7, 8]
+        && request.resource.data.date.matches('^\\d{4}-\\d{2}-\\d{2}$')
+        && sessionId == request.resource.data.date + '_g' + string(request.resource.data.classGrade) + '_' + request.resource.data.section + '_l' + string(request.resource.data.lesson)
+        && request.resource.data.createdAt is timestamp;
+      allow update, delete: if false;
+    }
+  }
+}
